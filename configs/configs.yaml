@@ -1,0 +1,50 @@
+# Project Configuration
+project:
+  name: "discord-moderation-rl"
+  version: "0.1.0"
+
+# Data
+data:
+  raw_path: "data/raw"
+  processed_path: "data/processed"
+  embeddings_path: "data/embeddings"
+  max_messages: 100000  # For initial testing
+
+# Models
+models:
+  toxicity_model: "unitary/unbiased-toxic-roberta"
+  embedding_model: "all-MiniLM-L6-v2"
+  checkpoint_dir: "models/checkpoints"
+
+# Environment
+env:
+  max_episode_steps: 200
+  conversation_window: 20
+  actions:
+    - "ALLOW"
+    - "WARN"
+    - "DELETE"
+    - "BAN"
+
+# Rewards
+rewards:
+  engagement_per_message: 1.0
+  safety_violation_cost: 10.0
+  false_positive_penalty: 50.0
+  toxicity_threshold: 0.8
+
+# Training
+training:
+  total_timesteps: 1000000
+  learning_rate: 0.0003
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  gae_lambda: 0.95
+
+# Logging
+logging:
+  use_wandb: true
+  log_interval: 100
+  save_freq: 10000
