@@ -70,6 +70,7 @@ def main():
         ('stable_baselines3', 'Stable-Baselines3'),
         ('sb3_contrib', 'SB3-Contrib'),
         ('transformers', 'Transformers'),
+        ('sentence_transformers', 'Sentence-Transformers'),
         ('datasets', 'Datasets'),
         ('wandb', 'Weights & Biases'),
         ('pandas', 'Pandas'),
