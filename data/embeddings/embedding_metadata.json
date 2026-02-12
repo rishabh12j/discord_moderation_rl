@@ -1,0 +1,8 @@
+{
+  "num_messages": 78480,
+  "embedding_dim": 384,
+  "model_name": "all-MiniLM-L6-v2",
+  "normalized": true,
+  "conversations_file": "data/processed/conversations_with_users.csv",
+  "alignment": "Row i in embeddings corresponds to row i in conversations CSV"
+}

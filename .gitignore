@@ -31,3 +31,4 @@ wandb/
 .vscode/
 .idea/
 *.swp
+data/embeddings/*.npy 
