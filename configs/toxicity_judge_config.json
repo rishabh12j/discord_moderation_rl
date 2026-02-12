@@ -1,0 +1,6 @@
+{
+  "model_name": "unitary/unbiased-toxic-roberta",
+  "device": "cuda",
+  "batch_size": 32,
+  "avg_inference_time_ms": 0.3554081916809082
+}
