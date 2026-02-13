@@ -121,6 +121,106 @@ class DiscordEnv(gym.Env):
         
         print("✓ DiscordEnv initialized")
     
+    
+
+    def action_masks(self) -> np.ndarray:
+        """
+        Get valid action mask for current state.
+        
+        Action masking prevents invalid actions:
+        - Can't delete/warn/ban if user is already banned
+        - Can't warn/ban if message is from a moderator/admin
+        
+        Returns:
+            np.ndarray of shape (4,) with 1=valid, 0=invalid
+        """
+        if self.current_episode is None or self.current_step >= len(self.current_episode['messages']):
+            # Episode not started or ended - all actions invalid
+            return np.array([0, 0, 0, 0], dtype=np.int8)
+        
+        # Default: all actions valid
+        mask = np.ones(4, dtype=np.int8)
+        
+        current_message = self.current_episode['messages'][self.current_step]
+        current_user = current_message['user_id']
+        
+        # Rule 1: Can't moderate banned users (they're already gone)
+        if current_user in self.banned_users:
+            # Only ALLOW is valid (skip their messages)
+            mask = np.array([1, 0, 0, 0], dtype=np.int8)
+        
+        # Rule 2: Can't warn/ban moderators (in real system)
+        # For now, we'll keep this simple and allow all actions on all users
+        # In production, you'd check: if user_role == 'moderator': mask[1:] = 0
+        
+        return mask
+    
+    def _apply_user_simulator(self, user_id: str, action: int) -> None:
+        """
+        Apply user simulator logic - users react to moderation.
+        
+        User Behavior Dynamics:
+        - WARN on good_user: Next message toxicity ↓ 30%
+        - WARN on borderline: Next message toxicity ↓ 20% 
+        - WARN on troll: Next message toxicity ↑ 20% (gets angrier)
+        - BAN: User removed from conversation (skip future messages)
+        - DELETE: No behavioral change (just message removed)
+        
+        Args:
+            user_id: User who received moderation
+            action: Action taken (WARN or BAN)
+        """
+        if action == self.ACTION_WARN:
+            # Get user profile
+            user_features = None
+            for i, msg in enumerate(self.current_episode['messages']):
+                if msg['user_id'] == user_id:
+                    user_features = self.current_episode['user_features'][i]
+                    break
+            
+            if user_features is None:
+                return
+            
+            user_profile = user_features['profile']
+            
+            # Apply toxicity shift to future messages from this user
+            if user_id not in self.user_warnings:
+                self.user_warnings[user_id] = 0
+            self.user_warnings[user_id] += 1
+            
+            # Modify future messages from this user
+            for i in range(self.current_step + 1, len(self.current_episode['messages'])):
+                if self.current_episode['messages'][i]['user_id'] == user_id:
+                    # Apply shift based on profile
+                    if user_profile == 'good_user':
+                        # Good users become more careful
+                        shift = 0.7  # 30% reduction
+                    elif user_profile == 'borderline':
+                        # Borderline users improve slightly
+                        shift = 0.8  # 20% reduction
+                    else:  # troll
+                        # Trolls get angrier
+                        shift = 1.2  # 20% increase
+                    
+                    # Apply shift to toxicity score
+                    old_score = self.current_episode['messages'][i]['toxicity_score']
+                    new_score = np.clip(old_score * shift, 0.0, 1.0)
+                    self.current_episode['messages'][i]['toxicity_score'] = new_score
+                    
+                    # Update toxic label if score changed significantly
+                    self.current_episode['messages'][i]['toxic'] = int(new_score > 0.5)
+        
+        elif action == self.ACTION_BAN:
+            # Ban: user is removed from conversation
+            self.banned_users.add(user_id)
+            
+            # Mark all future messages from this user as "banned" (we'll skip them)
+            for i in range(self.current_step + 1, len(self.current_episode['messages'])):
+                if self.current_episode['messages'][i]['user_id'] == user_id:
+                    # In step(), we'll check banned_users and skip automatically
+                    pass
+
+
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
         """
         Reset environment to start of new episode.
@@ -168,6 +268,19 @@ class DiscordEnv(gym.Env):
         if self.current_episode is None:
             raise RuntimeError("Must call reset() before step()")
         
+        # Check action validity
+        valid_actions = self.action_masks()
+        if not valid_actions[action]:
+            # Invalid action taken - large penalty
+            print(f"WARNING: Invalid action {action} taken!")
+            reward = -100.0
+            terminated = False
+            truncated = False
+            observation = self._get_observation()
+            info = self._get_info()
+            info['invalid_action'] = True
+            return observation, reward, terminated, truncated, info
+        
         # Get current message
         current_message = self.current_episode['messages'][self.current_step]
         current_user = current_message['user_id']
@@ -193,13 +306,17 @@ class DiscordEnv(gym.Env):
         
         elif action == self.ACTION_WARN:
             # Warn user
-            self.user_warnings[current_user] = self.user_warnings.get(current_user, 0) + 1
             self.total_moderation_actions += 1
             
             # Small penalty for warning (reduces engagement)
             reward -= 0.1
             
-            # Apply to next message from this user (handled in _apply_user_simulator)
+            # Bonus if warning was justified
+            if is_toxic:
+                reward += 1.0
+            
+            # Apply user simulator
+            self._apply_user_simulator(current_user, action)
         
         elif action == self.ACTION_DELETE:
             # Delete message
@@ -211,10 +328,12 @@ class DiscordEnv(gym.Env):
             # Bonus if message was actually toxic
             if is_toxic:
                 reward += 2.0
+            else:
+                # Penalty for deleting safe content
+                reward -= 2.0
         
         elif action == self.ACTION_BAN:
             # Ban user
-            self.banned_users.add(current_user)
             self.total_moderation_actions += 1
             
             # Large penalty for banning
@@ -230,6 +349,9 @@ class DiscordEnv(gym.Env):
             elif user_avg_toxicity > 0.5:
                 # Banning a troll - bonus
                 reward += 10.0
+            
+            # Apply user simulator
+            self._apply_user_simulator(current_user, action)
         
         # Record action
         self.moderation_history.append({
@@ -244,6 +366,11 @@ class DiscordEnv(gym.Env):
         # Move to next step
         self.current_step += 1
         
+        # Skip messages from banned users
+        while (self.current_step < len(self.current_episode['messages']) and 
+               self.current_episode['messages'][self.current_step]['user_id'] in self.banned_users):
+            self.current_step += 1
+        
         # Check if episode is done
         if self.current_step >= len(self.current_episode['messages']):
             terminated = True
@@ -254,6 +381,10 @@ class DiscordEnv(gym.Env):
         
         # Get info
         info = self._get_info()
+        info['action_name'] = self.ACTION_NAMES[action]
+        
+        return observation, reward, terminated, truncated, info
+
         
         return observation, reward, terminated, truncated, info
     
