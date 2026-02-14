@@ -119,6 +119,17 @@ class DiscordEnv(gym.Env):
         self.server_message_count = 0
         self.total_moderation_actions = 0
         
+        self.episode_stats = {
+            'total_reward': 0.0,
+            'safety_violations': 0,
+            'false_positives': 0,  # Moderate safe content
+            'true_positives': 0,   # Moderate toxic content
+            'messages_allowed': 0,
+            'warnings_issued': 0,
+            'deletions': 0,
+            'bans': 0,
+        }
+        
         print("✓ DiscordEnv initialized")
     
     
@@ -222,13 +233,7 @@ class DiscordEnv(gym.Env):
 
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
-        """
-        Reset environment to start of new episode.
-        
-        Returns:
-            observation: Initial observation
-            info: Additional information
-        """
+        """Reset environment to start of new episode."""
         super().reset(seed=seed)
         
         # Sample new episode
@@ -245,6 +250,18 @@ class DiscordEnv(gym.Env):
         self.server_message_count = 0
         self.total_moderation_actions = 0
         
+        # Reset episode statistics
+        self.episode_stats = {
+            'total_reward': 0.0,
+            'safety_violations': 0,
+            'false_positives': 0,
+            'true_positives': 0,
+            'messages_allowed': 0,
+            'warnings_issued': 0,
+            'deletions': 0,
+            'bans': 0,
+        }
+        
         # Get initial observation
         observation = self._get_observation()
         info = self._get_info()
@@ -252,19 +269,7 @@ class DiscordEnv(gym.Env):
         return observation, info
     
     def step(self, action: int) -> Tuple[Dict, float, bool, bool, Dict]:
-        """
-        Execute one step in environment.
-        
-        Args:
-            action: Action to take (0=Allow, 1=Warn, 2=Delete, 3=Ban)
-        
-        Returns:
-            observation: Next observation
-            reward: Reward for this step
-            terminated: Whether episode ended naturally
-            truncated: Whether episode was cut off
-            info: Additional information
-        """
+        """Execute one step in environment."""
         if self.current_episode is None:
             raise RuntimeError("Must call reset() before step()")
         
@@ -272,13 +277,13 @@ class DiscordEnv(gym.Env):
         valid_actions = self.action_masks()
         if not valid_actions[action]:
             # Invalid action taken - large penalty
-            print(f"WARNING: Invalid action {action} taken!")
             reward = -100.0
             terminated = False
             truncated = False
             observation = self._get_observation()
             info = self._get_info()
             info['invalid_action'] = True
+            self.episode_stats['total_reward'] += reward
             return observation, reward, terminated, truncated, info
         
         # Get current message
@@ -292,14 +297,16 @@ class DiscordEnv(gym.Env):
         terminated = False
         truncated = False
         
-        # Execute action
+        # Execute action and track statistics
         if action == self.ACTION_ALLOW:
             # Allow message through
             reward += 1.0  # Engagement reward
+            self.episode_stats['messages_allowed'] += 1
             
             # Safety cost if toxic
             if is_toxic:
                 reward -= 10.0  # Safety violation
+                self.episode_stats['safety_violations'] += 1
             
             self.server_message_count += 1
             self.server_toxicity_sum += toxicity_score
@@ -307,13 +314,17 @@ class DiscordEnv(gym.Env):
         elif action == self.ACTION_WARN:
             # Warn user
             self.total_moderation_actions += 1
+            self.episode_stats['warnings_issued'] += 1
             
             # Small penalty for warning (reduces engagement)
             reward -= 0.1
             
-            # Bonus if warning was justified
+            # Track accuracy
             if is_toxic:
                 reward += 1.0
+                self.episode_stats['true_positives'] += 1
+            else:
+                self.episode_stats['false_positives'] += 1
             
             # Apply user simulator
             self._apply_user_simulator(current_user, action)
@@ -321,20 +332,24 @@ class DiscordEnv(gym.Env):
         elif action == self.ACTION_DELETE:
             # Delete message
             self.total_moderation_actions += 1
+            self.episode_stats['deletions'] += 1
             
             # Small penalty for deletion
             reward -= 0.5
             
-            # Bonus if message was actually toxic
+            # Track accuracy
             if is_toxic:
                 reward += 2.0
+                self.episode_stats['true_positives'] += 1
             else:
                 # Penalty for deleting safe content
                 reward -= 2.0
+                self.episode_stats['false_positives'] += 1
         
         elif action == self.ACTION_BAN:
             # Ban user
             self.total_moderation_actions += 1
+            self.episode_stats['bans'] += 1
             
             # Large penalty for banning
             reward -= 2.0
@@ -346,12 +361,17 @@ class DiscordEnv(gym.Env):
             if user_avg_toxicity < 0.2:
                 # Banning a good user - huge penalty
                 reward -= 50.0
+                self.episode_stats['false_positives'] += 1
             elif user_avg_toxicity > 0.5:
                 # Banning a troll - bonus
                 reward += 10.0
+                self.episode_stats['true_positives'] += 1
             
             # Apply user simulator
             self._apply_user_simulator(current_user, action)
+        
+        # Update episode total reward
+        self.episode_stats['total_reward'] += reward
         
         # Record action
         self.moderation_history.append({
@@ -379,14 +399,16 @@ class DiscordEnv(gym.Env):
             # Get next observation
             observation = self._get_observation()
         
-        # Get info
+        # Get info with statistics
         info = self._get_info()
         info['action_name'] = self.ACTION_NAMES[action]
         
-        return observation, reward, terminated, truncated, info
-
+        # Add episode statistics to final info
+        if terminated:
+            info['episode'] = self.episode_stats.copy()
         
         return observation, reward, terminated, truncated, info
+
     
     def _get_observation(self) -> Dict[str, np.ndarray]:
         """
