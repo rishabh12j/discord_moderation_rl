@@ -269,145 +269,168 @@ class DiscordEnv(gym.Env):
         return observation, info
     
     def step(self, action: int) -> Tuple[Dict, float, bool, bool, Dict]:
-        """Execute one step in environment."""
+        """
+        Execute one step in environment with robust state transitions.
+        
+        Handles:
+        - Invalid actions
+        - Banned user skipping
+        - User simulator effects
+        - Episode boundaries
+        - Detailed statistics tracking
+        """
         if self.current_episode is None:
             raise RuntimeError("Must call reset() before step()")
         
-        # Check action validity
-        valid_actions = self.action_masks()
-        if not valid_actions[action]:
-            # Invalid action taken - large penalty
+        # SAFETY: Check action is in valid range first
+        if not (0 <= action < self.action_space.n):
+            # Action out of bounds
             reward = -100.0
             terminated = False
             truncated = False
             observation = self._get_observation()
             info = self._get_info()
             info['invalid_action'] = True
+            info['invalid_reason'] = f'Action {action} out of bounds [0, {self.action_space.n})'
+            info['valid_actions'] = self.action_masks().tolist()
             self.episode_stats['total_reward'] += reward
             return observation, reward, terminated, truncated, info
         
-        # Get current message
-        current_message = self.current_episode['messages'][self.current_step]
+        # SAFETY: Check action validity (action masking)
+        valid_actions = self.action_masks()
+        if not valid_actions[action]:
+            reward = -100.0  # Invalid action penalty
+            terminated = False
+            truncated = False
+            observation = self._get_observation()
+            info = self._get_info()
+            info['invalid_action'] = True
+            info['invalid_reason'] = f'Action {self.ACTION_NAMES[action]} not allowed in current state'
+            info['valid_actions'] = valid_actions.tolist()
+            self.episode_stats['total_reward'] += reward
+            return observation, reward, terminated, truncated, info
+        
+        # Get current message data
+        current_idx = self.current_step
+        if current_idx >= len(self.current_episode['messages']):
+            # Episode already ended
+            terminated = True
+            observation = self._get_observation()
+            info = self._get_info()
+            return observation, 0.0, terminated, False, info
+        
+        current_message = self.current_episode['messages'][current_idx]
         current_user = current_message['user_id']
         is_toxic = current_message['toxic']
         toxicity_score = current_message['toxicity_score']
         
-        # Initialize reward
+        # Initialize step results
         reward = 0.0
         terminated = False
         truncated = False
         
-        # Execute action and track statistics
+        # === EXECUTE ACTION ===
         if action == self.ACTION_ALLOW:
             # Allow message through
             reward += 1.0  # Engagement reward
             self.episode_stats['messages_allowed'] += 1
             
-            # Safety cost if toxic
+            # Safety violation penalty
             if is_toxic:
-                reward -= 10.0  # Safety violation
+                reward -= 10.0
                 self.episode_stats['safety_violations'] += 1
             
+            # Update server stats
             self.server_message_count += 1
             self.server_toxicity_sum += toxicity_score
         
         elif action == self.ACTION_WARN:
-            # Warn user
-            self.total_moderation_actions += 1
+            reward -= 0.1  # Moderation cost
             self.episode_stats['warnings_issued'] += 1
+            self.total_moderation_actions += 1
             
-            # Small penalty for warning (reduces engagement)
-            reward -= 0.1
-            
-            # Track accuracy
             if is_toxic:
                 reward += 1.0
                 self.episode_stats['true_positives'] += 1
             else:
                 self.episode_stats['false_positives'] += 1
             
-            # Apply user simulator
+            # Apply behavioral change
             self._apply_user_simulator(current_user, action)
         
         elif action == self.ACTION_DELETE:
-            # Delete message
-            self.total_moderation_actions += 1
+            reward -= 0.5  # Deletion cost
             self.episode_stats['deletions'] += 1
+            self.total_moderation_actions += 1
             
-            # Small penalty for deletion
-            reward -= 0.5
-            
-            # Track accuracy
             if is_toxic:
                 reward += 2.0
                 self.episode_stats['true_positives'] += 1
             else:
-                # Penalty for deleting safe content
                 reward -= 2.0
                 self.episode_stats['false_positives'] += 1
         
         elif action == self.ACTION_BAN:
-            # Ban user
-            self.total_moderation_actions += 1
+            reward -= 2.0  # Ban cost
             self.episode_stats['bans'] += 1
+            self.total_moderation_actions += 1
             
-            # Large penalty for banning
-            reward -= 2.0
-            
-            # Check fairness: is this user actually bad?
-            user_features = self.current_episode['user_features'][self.current_step]
+            # Fairness penalty/bonus
+            user_features = self.current_episode['user_features'][current_idx]
             user_avg_toxicity = user_features['avg_toxicity']
             
             if user_avg_toxicity < 0.2:
-                # Banning a good user - huge penalty
-                reward -= 50.0
+                reward -= 50.0  # False positive ban
                 self.episode_stats['false_positives'] += 1
             elif user_avg_toxicity > 0.5:
-                # Banning a troll - bonus
-                reward += 10.0
+                reward += 10.0  # True positive ban
                 self.episode_stats['true_positives'] += 1
             
-            # Apply user simulator
-            self._apply_user_simulator(current_user, action)
+            # Remove user from conversation
+            self.banned_users.add(current_user)
         
-        # Update episode total reward
+        # Update episode reward
         self.episode_stats['total_reward'] += reward
         
-        # Record action
+        # Record action for analysis
         self.moderation_history.append({
-            'step': self.current_step,
+            'step': current_idx,
             'action': action,
             'user_id': current_user,
             'toxic': is_toxic,
             'toxicity_score': toxicity_score,
-            'reward': reward
+            'reward': reward,
+            'action_name': self.ACTION_NAMES[action]
         })
         
-        # Move to next step
+        # === STATE TRANSITION ===
         self.current_step += 1
         
-        # Skip messages from banned users
+        # Skip banned users' messages
         while (self.current_step < len(self.current_episode['messages']) and 
                self.current_episode['messages'][self.current_step]['user_id'] in self.banned_users):
             self.current_step += 1
+            # No reward for skipped messages
         
-        # Check if episode is done
+        # === TERMINATION CONDITIONS ===
         if self.current_step >= len(self.current_episode['messages']):
             terminated = True
-            observation = self._get_observation()  # Final observation
-        else:
-            # Get next observation
-            observation = self._get_observation()
         
-        # Get info with statistics
+        # Get next observation
+        observation = self._get_observation()
+        
+        # Prepare info
         info = self._get_info()
         info['action_name'] = self.ACTION_NAMES[action]
+        info['step_reward'] = reward
         
-        # Add episode statistics to final info
+        # Add episode statistics at end
         if terminated:
             info['episode'] = self.episode_stats.copy()
+            info['final_step'] = True
         
         return observation, reward, terminated, truncated, info
+
 
     
     def _get_observation(self) -> Dict[str, np.ndarray]:
@@ -468,27 +491,41 @@ class DiscordEnv(gym.Env):
         }
     
     def _get_info(self) -> Dict[str, Any]:
-        """
-        Get additional information about current state.
-        
-        Returns:
-            Dict with debug/analysis information
-        """
+        """Get comprehensive information about current state."""
         if self.current_episode is None or self.current_step >= len(self.current_episode['messages']):
-            return {}
+            return {
+                'episode_ended': True,
+                'episode_stats': self.episode_stats
+            }
         
         current_message = self.current_episode['messages'][self.current_step]
+        current_user_features = self.current_episode['user_features'][self.current_step]
         
-        return {
+        # Server stats
+        avg_server_toxicity = (
+            self.server_toxicity_sum / self.server_message_count 
+            if self.server_message_count > 0 else 0.0
+        )
+        
+        info = {
             'conversation_id': self.current_episode['metadata']['conversation_id'],
             'step': self.current_step,
             'user_id': current_message['user_id'],
+            'user_profile': current_user_features['profile'],
+            'user_avg_toxicity': current_user_features['avg_toxicity'],
             'message_text': current_message['text'],
             'is_toxic': bool(current_message['toxic']),
             'toxicity_score': float(current_message['toxicity_score']),
+            'server_avg_toxicity': avg_server_toxicity,
             'total_moderation_actions': self.total_moderation_actions,
-            'banned_users_count': len(self.banned_users)
+            'banned_users_count': len(self.banned_users),
+            'warnings_this_user': self.user_warnings.get(current_message['user_id'], 0),
+            'valid_actions': self.action_masks().tolist(),
+            'episode_progress': self.current_step / len(self.current_episode['messages'])
         }
+        
+        return info
+
     
     def render(self):
         """Render the environment (optional)."""
