@@ -168,68 +168,173 @@ class DiscordEnv(gym.Env):
     
     def _apply_user_simulator(self, user_id: str, action: int) -> None:
         """
-        Apply user simulator logic - users react to moderation.
+        Advanced user simulator with behavioral dynamics.
         
-        User Behavior Dynamics:
-        - WARN on good_user: Next message toxicity ↓ 30%
-        - WARN on borderline: Next message toxicity ↓ 20% 
-        - WARN on troll: Next message toxicity ↑ 20% (gets angrier)
-        - BAN: User removed from conversation (skip future messages)
-        - DELETE: No behavioral change (just message removed)
+        User Behavior Models:
+        
+        1. Good Users (avg_toxicity < 0.2):
+           - WARN: Toxicity ↓ 30% (become more careful)
+           - Multiple warnings: May leave (frustration)
+           
+        2. Borderline Users (0.2 ≤ avg_toxicity ≤ 0.5):
+           - WARN: Toxicity ↓ 20% (slight improvement)
+           - BAN: Creates server reputation effect
+           
+        3. Trolls (avg_toxicity > 0.5):
+           - WARN: Toxicity ↑ 20% (escalation - they get angrier)
+           - Multiple warnings: Toxicity ↑ 40% (severe escalation)
+           - BAN: Immediate removal (correct action)
+        
+        Server-Level Effects:
+        - Banning trolls improves overall server atmosphere
+        - Banning good users damages server reputation
         
         Args:
-            user_id: User who received moderation
+            user_id: User receiving moderation action
             action: Action taken (WARN or BAN)
         """
+        if action not in [self.ACTION_WARN, self.ACTION_BAN]:
+            return
+        
+        # Get user profile
+        user_features = None
+        for i, msg in enumerate(self.current_episode['messages']):
+            if msg['user_id'] == user_id:
+                user_features = self.current_episode['user_features'][i]
+                break
+        
+        if user_features is None:
+            return
+        
+        user_profile = user_features['profile']
+        user_avg_toxicity = user_features['avg_toxicity']
+        
+        # === WARNING EFFECTS ===
         if action == self.ACTION_WARN:
-            # Get user profile
-            user_features = None
-            for i, msg in enumerate(self.current_episode['messages']):
-                if msg['user_id'] == user_id:
-                    user_features = self.current_episode['user_features'][i]
-                    break
-            
-            if user_features is None:
-                return
-            
-            user_profile = user_features['profile']
-            
-            # Apply toxicity shift to future messages from this user
+            # Track warning count
             if user_id not in self.user_warnings:
                 self.user_warnings[user_id] = 0
             self.user_warnings[user_id] += 1
             
-            # Modify future messages from this user
+            warning_count = self.user_warnings[user_id]
+            
+            # Apply toxicity shift to ALL future messages from this user
             for i in range(self.current_step + 1, len(self.current_episode['messages'])):
                 if self.current_episode['messages'][i]['user_id'] == user_id:
-                    # Apply shift based on profile
-                    if user_profile == 'good_user':
-                        # Good users become more careful
-                        shift = 0.7  # 30% reduction
-                    elif user_profile == 'borderline':
-                        # Borderline users improve slightly
-                        shift = 0.8  # 20% reduction
-                    else:  # troll
-                        # Trolls get angrier
-                        shift = 1.2  # 20% increase
-                    
-                    # Apply shift to toxicity score
                     old_score = self.current_episode['messages'][i]['toxicity_score']
+                    
+                    # Determine shift based on user type and warning count
+                    if user_profile == 'good_user':
+                        # Good users: warnings work well
+                        if warning_count == 1:
+                            shift = 0.7  # 30% reduction
+                        elif warning_count == 2:
+                            shift = 0.5  # 50% reduction (very careful now)
+                        else:
+                            # 3+ warnings on good user = frustration, might leave
+                            # Mark for potential early exit
+                            shift = 1.5  # Frustrated, toxicity increases
+                    
+                    elif user_profile == 'borderline':
+                        # Borderline users: moderate improvement
+                        if warning_count == 1:
+                            shift = 0.8  # 20% reduction
+                        elif warning_count == 2:
+                            shift = 0.7  # 30% reduction (learning)
+                        else:
+                            shift = 0.6  # 40% reduction (reformed)
+                    
+                    else:  # troll
+                        # Trolls: warnings backfire (escalation)
+                        if warning_count == 1:
+                            shift = 1.2  # 20% increase (angry)
+                        elif warning_count == 2:
+                            shift = 1.4  # 40% increase (very angry)
+                        else:
+                            shift = 1.6  # 60% increase (rage mode)
+                    
+                    # Apply shift
                     new_score = np.clip(old_score * shift, 0.0, 1.0)
                     self.current_episode['messages'][i]['toxicity_score'] = new_score
                     
-                    # Update toxic label if score changed significantly
+                    # Update toxic label if threshold crossed
                     self.current_episode['messages'][i]['toxic'] = int(new_score > 0.5)
         
+        # === BAN EFFECTS ===
         elif action == self.ACTION_BAN:
-            # Ban: user is removed from conversation
+            # Ban: user removed from conversation
             self.banned_users.add(user_id)
             
-            # Mark all future messages from this user as "banned" (we'll skip them)
-            for i in range(self.current_step + 1, len(self.current_episode['messages'])):
-                if self.current_episode['messages'][i]['user_id'] == user_id:
-                    # In step(), we'll check banned_users and skip automatically
-                    pass
+            # Server-level reputation effects
+            if user_profile == 'good_user':
+                # Banning good users damages server atmosphere
+                # Increase toxicity of OTHER users slightly (they feel unsafe)
+                for i in range(self.current_step + 1, len(self.current_episode['messages'])):
+                    other_user = self.current_episode['messages'][i]['user_id']
+                    if other_user != user_id and other_user not in self.banned_users:
+                        old_score = self.current_episode['messages'][i]['toxicity_score']
+                        # Small toxicity increase (5%) for remaining users
+                        new_score = np.clip(old_score * 1.05, 0.0, 1.0)
+                        self.current_episode['messages'][i]['toxicity_score'] = new_score
+                        self.current_episode['messages'][i]['toxic'] = int(new_score > 0.5)
+            
+            elif user_profile == 'troll':
+                # Banning trolls improves server atmosphere
+                # Decrease toxicity of OTHER users slightly (they feel safer)
+                for i in range(self.current_step + 1, len(self.current_episode['messages'])):
+                    other_user = self.current_episode['messages'][i]['user_id']
+                    if other_user != user_id and other_user not in self.banned_users:
+                        old_score = self.current_episode['messages'][i]['toxicity_score']
+                        # Small toxicity decrease (10%) for remaining users
+                        new_score = np.clip(old_score * 0.9, 0.0, 1.0)
+                        self.current_episode['messages'][i]['toxicity_score'] = new_score
+                        self.current_episode['messages'][i]['toxic'] = int(new_score > 0.5)
+
+    def _get_server_atmosphere(self) -> float:
+        """
+        Calculate current server atmosphere score (0-1).
+        
+        Higher = healthier community
+        - Based on average toxicity of allowed messages
+        - Penalized by false positive bans
+        - Improved by troll removal
+        
+        Returns:
+            float: Server atmosphere score
+        """
+        if self.server_message_count == 0:
+            return 0.5  # Neutral start
+        
+        # Base atmosphere: inverse of average toxicity
+        avg_toxicity = self.server_toxicity_sum / self.server_message_count
+        base_atmosphere = 1.0 - avg_toxicity
+        
+        # Penalty for false positive bans (banning good users)
+        false_positive_penalty = self.episode_stats['false_positives'] * 0.05
+        
+        # Bonus for removing trolls
+        troll_removal_bonus = len(self.banned_users) * 0.02
+        
+        atmosphere = base_atmosphere - false_positive_penalty + troll_removal_bonus
+        
+        return np.clip(atmosphere, 0.0, 1.0)
+    
+    def _get_user_escalation_level(self, user_id: str) -> int:
+        """
+        Get escalation level for a user (0-3).
+        
+        0 = No warnings
+        1 = First warning
+        2 = Second warning (elevated)
+        3 = Third+ warning (severe)
+        
+        Args:
+            user_id: User to check
+        
+        Returns:
+            int: Escalation level
+        """
+        return min(self.user_warnings.get(user_id, 0), 3)
 
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
@@ -495,11 +600,13 @@ class DiscordEnv(gym.Env):
         if self.current_episode is None or self.current_step >= len(self.current_episode['messages']):
             return {
                 'episode_ended': True,
-                'episode_stats': self.episode_stats
+                'episode_stats': self.episode_stats,
+                'server_atmosphere': self._get_server_atmosphere()
             }
         
         current_message = self.current_episode['messages'][self.current_step]
         current_user_features = self.current_episode['user_features'][self.current_step]
+        current_user = current_message['user_id']
         
         # Server stats
         avg_server_toxicity = (
@@ -508,23 +615,33 @@ class DiscordEnv(gym.Env):
         )
         
         info = {
+            # Message info
             'conversation_id': self.current_episode['metadata']['conversation_id'],
             'step': self.current_step,
-            'user_id': current_message['user_id'],
+            'user_id': current_user,
             'user_profile': current_user_features['profile'],
             'user_avg_toxicity': current_user_features['avg_toxicity'],
             'message_text': current_message['text'],
             'is_toxic': bool(current_message['toxic']),
             'toxicity_score': float(current_message['toxicity_score']),
+            
+            # Server stats
             'server_avg_toxicity': avg_server_toxicity,
+            'server_atmosphere': self._get_server_atmosphere(),
             'total_moderation_actions': self.total_moderation_actions,
             'banned_users_count': len(self.banned_users),
-            'warnings_this_user': self.user_warnings.get(current_message['user_id'], 0),
+            
+            # User-specific dynamics
+            'warnings_this_user': self.user_warnings.get(current_user, 0),
+            'escalation_level': self._get_user_escalation_level(current_user),
+            
+            # Action info
             'valid_actions': self.action_masks().tolist(),
             'episode_progress': self.current_step / len(self.current_episode['messages'])
         }
         
         return info
+
 
     
     def render(self):
