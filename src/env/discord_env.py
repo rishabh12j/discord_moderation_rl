@@ -1,740 +1,383 @@
-"""
-Discord Moderation RL Environment
-Gymnasium-compatible environment for training moderation agents.
-"""
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import gymnasium as gym
-from gymnasium import spaces
 import numpy as np
-from typing import Dict, Tuple, Optional, Any
+from gymnasium import spaces
+
 import sys
 from pathlib import Path
-
-# Add src to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
 
-from utils.episode_builder import EpisodeBuilder
-from utils.toxicity_judge import ToxicityJudge
+from utils.episode_builder import load_base_data, episode_generator
+from utils.build_user_norms import USER_NORMS_PATH  # adjust if path different
+import json
+from pathlib import Path
+from utils.language_utils import SUPPORTED_LANGUAGES
+
+@dataclass
+class UserNorm:
+    overall_avg_toxicity: float
+    message_count: int
+
+
+def load_user_norms(path: Path) -> Dict[str, UserNorm]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"User norms file not found at {path}. Run build_user_norms.py first."
+        )
+    with path.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    norms: Dict[str, UserNorm] = {}
+    for user_id, data in raw.items():
+        norms[user_id] = UserNorm(
+            overall_avg_toxicity=float(data["overall_avg_toxicity"]),
+            message_count=int(data["message_count"]),
+        )
+    return norms
 
 
 class DiscordEnv(gym.Env):
     """
-    Discord Moderation Environment.
-    
-    Observation Space:
-        Dict with:
-        - message_embedding: Box(384,) - Semantic content
-        - user_history: Box(5,) - [avg_toxicity, total_messages, toxic_messages, 
-                                    join_days_ago, recent_warnings]
-        - server_stats: Box(3,) - [server_avg_toxicity, total_moderation_actions, 
-                                    recent_toxicity_trend]
-    
-    Action Space:
-        Discrete(4):
-        - 0: Allow (let message through)
-        - 1: Warn (warn user, message stays)
-        - 2: Delete (remove message)
-        - 3: Ban (ban user, end their participation)
-    
-    Rewards:
-        Engagement reward: +1 per message allowed
-        Safety cost: +10 for toxic message allowed
-        Fairness penalty: -50 for banning good users
+    Discord moderation environment with language-agnostic content features.
+
+    Observation (Dict):
+        - message_embedding: (384,) float32 in [-1, 1]
+        - user_history: (2,) float32 in [0, 1]
+            [overall_avg_tox, msg_count_norm]
+        - server_stats: (4,) float32 in [0, 1]
+            placeholder for recent server-wide metrics
+
+    Action (Discrete(4)):
+        0 = ALLOW
+        1 = WARN
+        2 = DELETE
+        3 = BAN
     """
-    
-    metadata = {'render_modes': ['human', 'ansi']}
-    
-    # Action constants
-    ACTION_ALLOW = 0
-    ACTION_WARN = 1
-    ACTION_DELETE = 2
-    ACTION_BAN = 3
-    
-    ACTION_NAMES = {
-        0: "ALLOW",
-        1: "WARN",
-        2: "DELETE",
-        3: "BAN"
-    }
-    
-    def __init__(self,
-                 episode_builder: Optional[EpisodeBuilder] = None,
-                 toxicity_judge: Optional[ToxicityJudge] = None,
-                 max_steps: int = 20,
-                 render_mode: Optional[str] = None):
-        """
-        Initialize Discord moderation environment.
-        
-        Args:
-            episode_builder: EpisodeBuilder instance (created if None)
-            toxicity_judge: ToxicityJudge instance (created if None)
-            max_steps: Maximum steps per episode (default: 20)
-            render_mode: Render mode ('human' or 'ansi')
-        """
+
+    metadata = {"render_modes": []}
+
+    EMBEDDING_DIM = 384
+    USER_HISTORY_DIM = 2
+    SERVER_STATS_DIM = 4
+
+    def __init__(
+        self,
+        chunk_size: int = 20,
+        max_steps_per_chunk: Optional[int] = None,
+    ):
         super().__init__()
-        
-        # Initialize components
-        print("Initializing DiscordEnv...")
-        
-        if episode_builder is None:
-            print("  Creating EpisodeBuilder...")
-            self.episode_builder = EpisodeBuilder()
-        else:
-            self.episode_builder = episode_builder
-        
-        if toxicity_judge is None:
-            print("  Creating ToxicityJudge...")
-            self.toxicity_judge = ToxicityJudge(device="cuda", batch_size=32)
-        else:
-            self.toxicity_judge = toxicity_judge
-        
-        self.max_steps = max_steps
-        self.render_mode = render_mode
-        
-        # Define observation space
-        self.observation_space = spaces.Dict({
-            'message_embedding': spaces.Box(
-                low=-1.0, high=1.0, shape=(384,), dtype=np.float32
-            ),
-            'user_history': spaces.Box(
-                low=0.0, high=np.inf, shape=(5,), dtype=np.float32
-            ),
-            'server_stats': spaces.Box(
-                low=0.0, high=np.inf, shape=(3,), dtype=np.float32
-            )
-        })
-        
-        # Define action space
+
+        # ----- observation & action spaces -----
+        self.observation_space = spaces.Dict(
+            {
+                "message_embedding": spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(self.EMBEDDING_DIM,),
+                    dtype=np.float32,
+                ),
+                "user_history": spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(self.USER_HISTORY_DIM,),
+                    dtype=np.float32,
+                ),
+                "server_stats": spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(self.SERVER_STATS_DIM,),
+                    dtype=np.float32,
+                ),
+            }
+        )
+
         self.action_space = spaces.Discrete(4)
+
+        # ----- data -----
+        df, embeddings, scores = load_base_data()
+        self._df = df
+        self._embeddings = embeddings
+        self._scores = scores
+
+        self._episodes = list(
+            episode_generator(df, embeddings, scores, chunk_size=chunk_size)
+        )
+        if not self._episodes:
+            raise ValueError("No episode chunks generated. Check chunk_size and data.")
+
+        self._num_episodes = len(self._episodes)
+        self._chunk_size = chunk_size
+        self._max_steps_per_chunk = max_steps_per_chunk or chunk_size
+
+        # ----- user norms -----
+        self._user_norms = load_user_norms(USER_NORMS_PATH)
+        self._user_msg_count_stats = self._compute_msg_count_stats()
+
+        # ----- state -----
+        self._current_episode_index: int = 0
+        self._current_step_in_chunk: int = 0
+        self._current_chunk = None
+        self._current_language: Optional[str] = None
+        self._current_user_id: Optional[str] = None
+
+        # server-level running stats (placeholder)
+        self._server_recent_toxicity: float = 0.0
+        self._server_ban_rate: float = 0.0
+        self._server_warn_rate: float = 0.0
+        self._server_engagement: float = 1.0
+
+        self._total_actions: int = 0
+        self._total_bans: int = 0
+        self._total_warns: int = 0
+
+        self._rng = np.random.default_rng()
+        # Tracks language distribution per chunk for fairness auditing
+        self._current_language_distribution: Counter = Counter()
         
-        # Episode state
-        self.current_episode = None
-        self.current_step = 0
-        self.banned_users = set()
-        self.user_warnings = {}  # user_id -> warning_count
-        self.moderation_history = []
-        
-        # Server-level statistics
-        self.server_toxicity_sum = 0.0
-        self.server_message_count = 0
-        self.total_moderation_actions = 0
-        
-        self.episode_stats = {
-            'total_reward': 0.0,
-            'safety_violations': 0,
-            'false_positives': 0,  # Moderate safe content
-            'true_positives': 0,   # Moderate toxic content
-            'messages_allowed': 0,
-            'warnings_issued': 0,
-            'deletions': 0,
-            'bans': 0,
+        # History buffers to track actions and rewards for the current chunk
+        self._episode_actions_history: List[int] = []
+        self._episode_rewards_history: List[float] = []
+        thresholds_path = Path(__file__).resolve().parents[2] / "data" / "calibrated_thresholds.json"
+        if thresholds_path.exists():
+            with open(thresholds_path, "r") as f:
+                self._calibrated_thresholds = json.load(f)
+        else:
+            self._calibrated_thresholds = {"default": 0.8}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _compute_msg_count_stats(self) -> Dict[str, float]:
+        counts = np.array(
+            [u.message_count for u in self._user_norms.values()], dtype=np.float32
+        )
+        return {
+            "min": float(counts.min()),
+            "max": float(counts.max()),
+            "mean": float(counts.mean()),
         }
-        
-        print("✓ DiscordEnv initialized")
-    
-    
 
-    def action_masks(self) -> np.ndarray:
-        """
-        Get valid action mask for current state.
-        
-        Action masking prevents invalid actions:
-        - Can't delete/warn/ban if user is already banned
-        - Can't warn/ban if message is from a moderator/admin
-        
-        Returns:
-            np.ndarray of shape (4,) with 1=valid, 0=invalid
-        """
-        if self.current_episode is None or self.current_step >= len(self.current_episode['messages']):
-            # Episode not started or ended - all actions invalid
-            return np.array([0, 0, 0, 0], dtype=np.int8)
-        
-        # Default: all actions valid
-        mask = np.ones(4, dtype=np.int8)
-        
-        current_message = self.current_episode['messages'][self.current_step]
-        current_user = current_message['user_id']
-        
-        # Rule 1: Can't moderate banned users (they're already gone)
-        if current_user in self.banned_users:
-            # Only ALLOW is valid (skip their messages)
-            mask = np.array([1, 0, 0, 0], dtype=np.int8)
-        
-        # Rule 2: Can't warn/ban moderators (in real system)
-        # For now, we'll keep this simple and allow all actions on all users
-        # In production, you'd check: if user_role == 'moderator': mask[1:] = 0
-        
-        return mask
-    
-    def _apply_user_simulator(self, user_id: str, action: int) -> None:
-        """
-        Advanced user simulator with behavioral dynamics.
-        
-        User Behavior Models:
-        
-        1. Good Users (avg_toxicity < 0.2):
-           - WARN: Toxicity ↓ 30% (become more careful)
-           - Multiple warnings: May leave (frustration)
-           
-        2. Borderline Users (0.2 ≤ avg_toxicity ≤ 0.5):
-           - WARN: Toxicity ↓ 20% (slight improvement)
-           - BAN: Creates server reputation effect
-           
-        3. Trolls (avg_toxicity > 0.5):
-           - WARN: Toxicity ↑ 20% (escalation - they get angrier)
-           - Multiple warnings: Toxicity ↑ 40% (severe escalation)
-           - BAN: Immediate removal (correct action)
-        
-        Server-Level Effects:
-        - Banning trolls improves overall server atmosphere
-        - Banning good users damages server reputation
-        
-        Args:
-            user_id: User receiving moderation action
-            action: Action taken (WARN or BAN)
-        """
-        if action not in [self.ACTION_WARN, self.ACTION_BAN]:
-            return
-        
-        # Get user profile
-        user_features = None
-        for i, msg in enumerate(self.current_episode['messages']):
-            if msg['user_id'] == user_id:
-                user_features = self.current_episode['user_features'][i]
-                break
-        
-        if user_features is None:
-            return
-        
-        user_profile = user_features['profile']
-        user_avg_toxicity = user_features['avg_toxicity']
-        
-        # === WARNING EFFECTS ===
-        if action == self.ACTION_WARN:
-            # Track warning count
-            if user_id not in self.user_warnings:
-                self.user_warnings[user_id] = 0
-            self.user_warnings[user_id] += 1
-            
-            warning_count = self.user_warnings[user_id]
-            
-            # Apply toxicity shift to ALL future messages from this user
-            for i in range(self.current_step + 1, len(self.current_episode['messages'])):
-                if self.current_episode['messages'][i]['user_id'] == user_id:
-                    old_score = self.current_episode['messages'][i]['toxicity_score']
-                    
-                    # Determine shift based on user type and warning count
-                    if user_profile == 'good_user':
-                        # Good users: warnings work well
-                        if warning_count == 1:
-                            shift = 0.7  # 30% reduction
-                        elif warning_count == 2:
-                            shift = 0.5  # 50% reduction (very careful now)
-                        else:
-                            # 3+ warnings on good user = frustration, might leave
-                            # Mark for potential early exit
-                            shift = 1.5  # Frustrated, toxicity increases
-                    
-                    elif user_profile == 'borderline':
-                        # Borderline users: moderate improvement
-                        if warning_count == 1:
-                            shift = 0.8  # 20% reduction
-                        elif warning_count == 2:
-                            shift = 0.7  # 30% reduction (learning)
-                        else:
-                            shift = 0.6  # 40% reduction (reformed)
-                    
-                    else:  # troll
-                        # Trolls: warnings backfire (escalation)
-                        if warning_count == 1:
-                            shift = 1.2  # 20% increase (angry)
-                        elif warning_count == 2:
-                            shift = 1.4  # 40% increase (very angry)
-                        else:
-                            shift = 1.6  # 60% increase (rage mode)
-                    
-                    # Apply shift
-                    new_score = np.clip(old_score * shift, 0.0, 1.0)
-                    self.current_episode['messages'][i]['toxicity_score'] = new_score
-                    
-                    # Update toxic label if threshold crossed
-                    self.current_episode['messages'][i]['toxic'] = int(new_score > 0.5)
-        
-        # === BAN EFFECTS ===
-        elif action == self.ACTION_BAN:
-            # Ban: user removed from conversation
-            self.banned_users.add(user_id)
-            
-            # Server-level reputation effects
-            if user_profile == 'good_user':
-                # Banning good users damages server atmosphere
-                # Increase toxicity of OTHER users slightly (they feel unsafe)
-                for i in range(self.current_step + 1, len(self.current_episode['messages'])):
-                    other_user = self.current_episode['messages'][i]['user_id']
-                    if other_user != user_id and other_user not in self.banned_users:
-                        old_score = self.current_episode['messages'][i]['toxicity_score']
-                        # Small toxicity increase (5%) for remaining users
-                        new_score = np.clip(old_score * 1.05, 0.0, 1.0)
-                        self.current_episode['messages'][i]['toxicity_score'] = new_score
-                        self.current_episode['messages'][i]['toxic'] = int(new_score > 0.5)
-            
-            elif user_profile == 'troll':
-                # Banning trolls improves server atmosphere
-                # Decrease toxicity of OTHER users slightly (they feel safer)
-                for i in range(self.current_step + 1, len(self.current_episode['messages'])):
-                    other_user = self.current_episode['messages'][i]['user_id']
-                    if other_user != user_id and other_user not in self.banned_users:
-                        old_score = self.current_episode['messages'][i]['toxicity_score']
-                        # Small toxicity decrease (10%) for remaining users
-                        new_score = np.clip(old_score * 0.9, 0.0, 1.0)
-                        self.current_episode['messages'][i]['toxicity_score'] = new_score
-                        self.current_episode['messages'][i]['toxic'] = int(new_score > 0.5)
+    def _sample_episode(self):
+        self._current_episode_index = int(self._rng.integers(0, self._num_episodes))
+        self._current_chunk = self._episodes[self._current_episode_index]
+        self._current_step_in_chunk = 0
 
-    def _get_server_atmosphere(self) -> float:
-        """
-        Calculate current server atmosphere score (0-1).
-        
-        Higher = healthier community
-        - Based on average toxicity of allowed messages
-        - Penalized by false positive bans
-        - Improved by troll removal
-        
-        Returns:
-            float: Server atmosphere score
-        """
-        if self.server_message_count == 0:
-            return 0.5  # Neutral start
-        
-        # Base atmosphere: inverse of average toxicity
-        avg_toxicity = self.server_toxicity_sum / self.server_message_count
-        base_atmosphere = 1.0 - avg_toxicity
-        
-        # Penalty for false positive bans (banning good users)
-        false_positive_penalty = self.episode_stats['false_positives'] * 0.05
-        
-        # Bonus for removing trolls
-        troll_removal_bonus = len(self.banned_users) * 0.02
-        
-        atmosphere = base_atmosphere - false_positive_penalty + troll_removal_bonus
-        
-        return np.clip(atmosphere, 0.0, 1.0)
-    
-    def _get_user_escalation_level(self, user_id: str) -> int:
-        """
-        Get escalation level for a user (0-3).
-        
-        0 = No warnings
-        1 = First warning
-        2 = Second warning (elevated)
-        3 = Third+ warning (severe)
-        
-        Args:
-            user_id: User to check
-        
-        Returns:
-            int: Escalation level
-        """
-        return min(self.user_warnings.get(user_id, 0), 3)
+    def _get_user_norm_features(self, user_id: str) -> np.ndarray:
+        norm = self._user_norms.get(
+            user_id,
+            UserNorm(overall_avg_toxicity=0.0, message_count=1),
+        )
+        mc = float(norm.message_count)
+        mc_min = self._user_msg_count_stats["min"]
+        mc_max = self._user_msg_count_stats["max"]
+        # simple min-max normalization, avoid divide-by-zero
+        if mc_max > mc_min:
+            msg_count_norm = (mc - mc_min) / (mc_max - mc_min)
+        else:
+            msg_count_norm = 0.0
 
+        return np.array(
+            [norm.overall_avg_toxicity, msg_count_norm],
+            dtype=np.float32,
+        )
 
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None) -> Tuple[Dict, Dict]:
-        """Reset environment to start of new episode."""
+    def _get_server_stats_vec(self) -> np.ndarray:
+        return np.array(
+            [
+                self._server_recent_toxicity,
+                self._server_ban_rate,
+                self._server_warn_rate,
+                self._server_engagement,
+            ],
+            dtype=np.float32,
+        )
+
+    def _build_observation(self, idx: int) -> Dict[str, np.ndarray]:
+        emb = self._current_chunk.embeddings[idx].astype(np.float32)
+        user_id = self._current_chunk.user_ids[idx]
+
+        user_hist = self._get_user_norm_features(user_id)
+        server_stats = self._get_server_stats_vec()
+
+        # internal tracking only (not in observation)
+        self._current_language = self._current_chunk.languages[idx]
+        self._current_user_id = user_id
+
+        return {
+            "message_embedding": emb,
+            "user_history": user_hist,
+            "server_stats": server_stats,
+        }
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+        """
+        Resets the environment to a new episode chunk and clears histories.
+        """
         super().reset(seed=seed)
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+
+        # Pick a random episode chunk 
+        self._sample_episode()
         
-        # Sample new episode
-        self.current_episode = self.episode_builder.sample_episode()
-        self.current_step = 0
-        
-        # Reset episode-specific state
-        self.banned_users = set()
-        self.user_warnings = {}
-        self.moderation_history = []
-        
-        # Reset server stats for this episode
-        self.server_toxicity_sum = 0.0
-        self.server_message_count = 0
-        self.total_moderation_actions = 0
-        
-        # Reset episode statistics
-        self.episode_stats = {
-            'total_reward': 0.0,
-            'safety_violations': 0,
-            'false_positives': 0,
-            'true_positives': 0,
-            'messages_allowed': 0,
-            'warnings_issued': 0,
-            'deletions': 0,
-            'bans': 0,
+        # Reset step counter 
+        self._current_step_in_chunk = 0
+
+        # Reset episode histories
+        self._episode_actions_history = []
+        self._episode_rewards_history = []
+
+        # Track current_language_distribution = Counter() for fairness auditing 
+        self._current_language_distribution = Counter(self._current_chunk.languages)
+
+        # Build the initial observation
+        obs = self._build_observation(self._current_step_in_chunk)
+
+        # Info dict can expose the internal language distribution for debugging/callbacks
+        info = {
+            "episode_language_distribution": dict(self._current_language_distribution),
+            "starting_thread_id": self._current_chunk.thread_id
         }
-        
-        # Get initial observation
-        observation = self._get_observation()
-        info = self._get_info()
-        
-        return observation, info
-    
-    def step(self, action: int) -> Tuple[Dict, float, bool, bool, Dict]:
+
+        return obs, info
+
+    def step(self, action: int) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         """
-        Execute one step in environment with robust state transitions.
-        
-        Handles:
-        - Invalid actions
-        - Banned user skipping
-        - User simulator effects
-        - Episode boundaries
-        - Detailed statistics tracking
+        Executes the chosen action, updates the environment state, and returns the next observation.
         """
-        if self.current_episode is None:
-            raise RuntimeError("Must call reset() before step()")
+        assert self.action_space.contains(action), f"Invalid action: {action}"
         
-        # SAFETY: Check action is in valid range first
-        if not (0 <= action < self.action_space.n):
-            # Action out of bounds
-            reward = -100.0
-            terminated = False
-            truncated = False
-            observation = self._get_observation()
-            info = self._get_info()
-            info['invalid_action'] = True
-            info['invalid_reason'] = f'Action {action} out of bounds [0, {self.action_space.n})'
-            info['valid_actions'] = self.action_masks().tolist()
-            self.episode_stats['total_reward'] += reward
-            return observation, reward, terminated, truncated, info
+        info: Dict[str, Any] = {}
+        idx = self._current_step_in_chunk
+        current_score = self._current_chunk.toxicity_scores[idx]
+        current_lang = self._current_chunk.languages[idx]  # <-- ADD THIS LINE
         
-        # SAFETY: Check action validity (action masking)
-        valid_actions = self.action_masks()
-        if not valid_actions[action]:
-            reward = -100.0  # Invalid action penalty
-            terminated = False
-            truncated = False
-            observation = self._get_observation()
-            info = self._get_info()
-            info['invalid_action'] = True
-            info['invalid_reason'] = f'Action {self.ACTION_NAMES[action]} not allowed in current state'
-            info['valid_actions'] = valid_actions.tolist()
-            self.episode_stats['total_reward'] += reward
-            return observation, reward, terminated, truncated, info
+        # 1. Record action in the episode history (added in Day 9)
+        self._episode_actions_history.append(action)
         
-        # Get current message data
-        current_idx = self.current_step
-        if current_idx >= len(self.current_episode['messages']):
-            # Episode already ended
-            terminated = True
-            observation = self._get_observation()
-            info = self._get_info()
-            return observation, 0.0, terminated, False, info
+        current_user = self._current_chunk.user_ids[idx]
         
-        current_message = self.current_episode['messages'][current_idx]
-        current_user = current_message['user_id']
-        is_toxic = current_message['toxic']
-        toxicity_score = current_message['toxicity_score']
+        # If DELETE (action == 2), scrub the current message from memory
+        if action == 2:
+            self._current_chunk.messages[idx] = "[DELETED]"
+            self._current_chunk.embeddings[idx] = np.zeros(self.EMBEDDING_DIM, dtype=np.float32)
+            
+        # --- NEW DAY 12: User Simulator Logic ---
+        # If WARN (action == 1), reduce the toxicity of all future messages from this user in this chunk by 20%
+        elif action == 1:
+            for future_idx in range(idx + 1, len(self._current_chunk.messages)):
+                if self._current_chunk.user_ids[future_idx] == current_user:
+                    self._current_chunk.toxicity_scores[future_idx] *= 0.8
+                    
+        # If BAN (action == 3), scrub all future messages from this user in this chunk
+        elif action == 3:
+            for future_idx in range(idx + 1, len(self._current_chunk.messages)):
+                if self._current_chunk.user_ids[future_idx] == current_user:
+                    self._current_chunk.messages[future_idx] = "[BANNED]"
+                    self._current_chunk.embeddings[future_idx] = np.zeros(self.EMBEDDING_DIM, dtype=np.float32)
+                    self._current_chunk.toxicity_scores[future_idx] = 0.0
+            
+        # 3. Advance the step counter
+        self._current_step_in_chunk += 1
         
-        # Initialize step results
-        reward = 0.0
+        # 4. Check for episode termination/truncation
         terminated = False
         truncated = False
         
-        # === EXECUTE ACTION ===
-        if action == self.ACTION_ALLOW:
-            # Allow message through
-            reward += 1.0  # Engagement reward
-            self.episode_stats['messages_allowed'] += 1
-            
-            # Safety violation penalty
-            if is_toxic:
-                reward -= 10.0
-                self.episode_stats['safety_violations'] += 1
-            
-            # Update server stats
-            self.server_message_count += 1
-            self.server_toxicity_sum += toxicity_score
-        
-        elif action == self.ACTION_WARN:
-            reward -= 0.1  # Moderation cost
-            self.episode_stats['warnings_issued'] += 1
-            self.total_moderation_actions += 1
-            
-            if is_toxic:
-                reward += 1.0
-                self.episode_stats['true_positives'] += 1
-            else:
-                self.episode_stats['false_positives'] += 1
-            
-            # Apply behavioral change
-            self._apply_user_simulator(current_user, action)
-        
-        elif action == self.ACTION_DELETE:
-            reward -= 0.5  # Deletion cost
-            self.episode_stats['deletions'] += 1
-            self.total_moderation_actions += 1
-            
-            if is_toxic:
-                reward += 2.0
-                self.episode_stats['true_positives'] += 1
-            else:
-                reward -= 2.0
-                self.episode_stats['false_positives'] += 1
-        
-        elif action == self.ACTION_BAN:
-            reward -= 2.0  # Ban cost
-            self.episode_stats['bans'] += 1
-            self.total_moderation_actions += 1
-            
-            # Fairness penalty/bonus
-            user_features = self.current_episode['user_features'][current_idx]
-            user_avg_toxicity = user_features['avg_toxicity']
-            
-            if user_avg_toxicity < 0.2:
-                reward -= 50.0  # False positive ban
-                self.episode_stats['false_positives'] += 1
-            elif user_avg_toxicity > 0.5:
-                reward += 10.0  # True positive ban
-                self.episode_stats['true_positives'] += 1
-            
-            # Remove user from conversation
-            self.banned_users.add(current_user)
-        
-        # Update episode reward
-        self.episode_stats['total_reward'] += reward
-        
-        # Record action for analysis
-        self.moderation_history.append({
-            'step': current_idx,
-            'action': action,
-            'user_id': current_user,
-            'toxic': is_toxic,
-            'toxicity_score': toxicity_score,
-            'reward': reward,
-            'action_name': self.ACTION_NAMES[action]
-        })
-        
-        # === STATE TRANSITION ===
-        self.current_step += 1
-        
-        # Skip banned users' messages
-        while (self.current_step < len(self.current_episode['messages']) and 
-               self.current_episode['messages'][self.current_step]['user_id'] in self.banned_users):
-            self.current_step += 1
-            # No reward for skipped messages
-        
-        # === TERMINATION CONDITIONS ===
-        if self.current_step >= len(self.current_episode['messages']):
-            terminated = True
-        
-        # Get next observation
-        observation = self._get_observation()
-        
-        # Prepare info
-        info = self._get_info()
-        info['action_name'] = self.ACTION_NAMES[action]
-        info['step_reward'] = reward
-        
-        # Add episode statistics at end
-        if terminated:
-            info['episode'] = self.episode_stats.copy()
-            info['final_step'] = True
-        
-        return observation, reward, terminated, truncated, info
-
-
-    
-    def _get_observation(self) -> Dict[str, np.ndarray]:
-        """
-        Get current observation.
-        
-        Returns:
-            Dict with message_embedding, user_history, server_stats
-        """
-        if self.current_step >= len(self.current_episode['messages']):
-            # Episode ended - return zero observation
-            return {
-                'message_embedding': np.zeros(384, dtype=np.float32),
-                'user_history': np.zeros(5, dtype=np.float32),
-                'server_stats': np.zeros(3, dtype=np.float32)
-            }
-        
-        # Get current message embedding
-        message_embedding = self.current_episode['embeddings'][self.current_step].astype(np.float32)
-        
-        # Get user history
-        current_message = self.current_episode['messages'][self.current_step]
-        current_user = current_message['user_id']
-        user_features = self.current_episode['user_features'][self.current_step]
-        
-        user_history = np.array([
-            user_features['avg_toxicity'],
-            user_features['total_messages'],
-            user_features['toxic_messages'],
-            user_features['join_days_ago'],
-            self.user_warnings.get(current_user, 0)  # Recent warnings
-        ], dtype=np.float32)
-        
-        # Get server stats
-        avg_server_toxicity = (
-            self.server_toxicity_sum / self.server_message_count 
-            if self.server_message_count > 0 else 0.0
-        )
-        
-        # Recent toxicity trend (last 5 messages)
-        recent_start = max(0, self.current_step - 5)
-        recent_messages = self.current_episode['messages'][recent_start:self.current_step]
-        recent_toxicity = (
-            np.mean([m['toxicity_score'] for m in recent_messages]) 
-            if recent_messages else 0.0
-        )
-        
-        server_stats = np.array([
-            avg_server_toxicity,
-            self.total_moderation_actions,
-            recent_toxicity
-        ], dtype=np.float32)
-        
-        return {
-            'message_embedding': message_embedding,
-            'user_history': user_history,
-            'server_stats': server_stats
-        }
-    
-    def _get_info(self) -> Dict[str, Any]:
-        """Get comprehensive information about current state."""
-        if self.current_episode is None or self.current_step >= len(self.current_episode['messages']):
-            return {
-                'episode_ended': True,
-                'episode_stats': self.episode_stats,
-                'server_atmosphere': self._get_server_atmosphere()
-            }
-        
-        current_message = self.current_episode['messages'][self.current_step]
-        current_user_features = self.current_episode['user_features'][self.current_step]
-        current_user = current_message['user_id']
-        
-        # Server stats
-        avg_server_toxicity = (
-            self.server_toxicity_sum / self.server_message_count 
-            if self.server_message_count > 0 else 0.0
-        )
-        
-        info = {
-            # Message info
-            'conversation_id': self.current_episode['metadata']['conversation_id'],
-            'step': self.current_step,
-            'user_id': current_user,
-            'user_profile': current_user_features['profile'],
-            'user_avg_toxicity': current_user_features['avg_toxicity'],
-            'message_text': current_message['text'],
-            'is_toxic': bool(current_message['toxic']),
-            'toxicity_score': float(current_message['toxicity_score']),
-            
-            # Server stats
-            'server_avg_toxicity': avg_server_toxicity,
-            'server_atmosphere': self._get_server_atmosphere(),
-            'total_moderation_actions': self.total_moderation_actions,
-            'banned_users_count': len(self.banned_users),
-            
-            # User-specific dynamics
-            'warnings_this_user': self.user_warnings.get(current_user, 0),
-            'escalation_level': self._get_user_escalation_level(current_user),
-            
-            # Action info
-            'valid_actions': self.action_masks().tolist(),
-            'episode_progress': self.current_step / len(self.current_episode['messages'])
-        }
-        
-        return info
-
-
-    
-    def render(self):
-        """Render the environment (optional)."""
-        if self.render_mode == 'human' or self.render_mode == 'ansi':
-            if self.current_episode is None:
-                print("Environment not initialized. Call reset() first.")
-                return
-            
-            if self.current_step > 0:
-                last_action = self.moderation_history[-1]
-                print(f"\n{'='*70}")
-                print(f"Step {self.current_step-1}: {self.ACTION_NAMES[last_action['action']]}")
-                print(f"Message: {last_action['user_id']}: "
-                      f"{self.current_episode['messages'][last_action['step']]['text'][:60]}...")
-                print(f"Toxic: {last_action['toxic']} | Score: {last_action['toxicity_score']:.3f}")
-                print(f"Reward: {last_action['reward']:.2f}")
-    
-    def close(self):
-        """Clean up resources."""
-        pass
-
-
-def main():
-    """Test environment initialization."""
-    print("=" * 70)
-    print("Day 8: Gymnasium Environment Skeleton Test")
-    print("=" * 70)
-    
-    # Create environment
-    env = DiscordEnv()
-    
-    # Test observation and action spaces
-    print("\n" + "=" * 70)
-    print("Space Definitions")
-    print("=" * 70)
-    
-    print("\nObservation Space:")
-    print(f"  Type: {type(env.observation_space)}")
-    print(f"  Keys: {list(env.observation_space.spaces.keys())}")
-    for key, space in env.observation_space.spaces.items():
-        print(f"    {key}: {space}")
-    
-    print("\nAction Space:")
-    print(f"  Type: {type(env.action_space)}")
-    print(f"  N: {env.action_space.n}")
-    print(f"  Actions: {env.ACTION_NAMES}")
-    
-    # Test reset
-    print("\n" + "=" * 70)
-    print("Testing reset()")
-    print("=" * 70)
-    
-    observation, info = env.reset()
-    
-    print("\nInitial Observation:")
-    print(f"  message_embedding shape: {observation['message_embedding'].shape}")
-    print(f"  user_history shape: {observation['user_history'].shape}")
-    print(f"  server_stats shape: {observation['server_stats'].shape}")
-    
-    print("\nInitial Info:")
-    for key, value in info.items():
-        if key == 'message_text':
-            print(f"  {key}: {value[:60]}...")
+        # If we reached the end of the chunk
+        if self._current_step_in_chunk >= len(self._current_chunk.messages) or self._current_step_in_chunk >= self._max_steps_per_chunk:
+            truncated = True
+            # Build observation using the last valid index to prevent out-of-bounds errors
+            obs = self._build_observation(idx) 
         else:
-            print(f"  {key}: {value}")
-    
-    # Test a few steps
-    print("\n" + "=" * 70)
-    print("Testing step() - Random Actions")
-    print("=" * 70)
-    
-    for i in range(5):
-        action = env.action_space.sample()
-        observation, reward, terminated, truncated, info = env.step(action)
+            # Normal observation for the next step
+            obs = self._build_observation(self._current_step_in_chunk)
+            
+        # 5. Reward (Placeholder for Phase 3)
+        # 1. Calculate Confidence Weight
+        # SUPPORTED_LANGUAGES should already be imported at the top of the file
+        confidence_weight = 1.0 if self._current_language in SUPPORTED_LANGUAGES else 0.6
         
-        print(f"\nStep {i}:")
-        print(f"  Action: {env.ACTION_NAMES[action]}")
-        print(f"  Reward: {reward:.2f}")
-        print(f"  Terminated: {terminated}")
-        print(f"  Message: {info['message_text'][:50]}...")
-        print(f"  Toxic: {info['is_toxic']} (score: {info['toxicity_score']:.3f})")
+        # 2. Calculate Safety Cost 
+        # Triggered if a highly toxic message is present. 
+        # Get the calibrated threshold for the current language, fallback to 'default' if not found
+        threshold = self._calibrated_thresholds.get(current_lang, self._calibrated_thresholds.get("default", 0.8))
         
-        if terminated:
-            print("\n  Episode ended!")
-            break
-    
-    print("\n" + "=" * 70)
-    print("✅ Day 8 Complete!")
-    print("=" * 70)
-    print("\nEnvironment skeleton is working!")
-    print("Next: Day 9 - Implement reset() details and episode sampling")
+        # Triggered if the message's toxicity exceeds this language's specific 90th percentile threshold
+        safety_cost = (10.0 * confidence_weight) if current_score > threshold else 0.0
+        #safety_cost = (10.0 * confidence_weight) if current_score > 0.8 else 0.0
+        
+        # 3. Calculate Base Reward
+        if action == 0:  # ALLOW
+            # +1 for fostering engagement, minus safety cost if it was actually toxic
+            reward = 1.0 - safety_cost
+            
+            # Log the incurred cost in info for the Lagrangian wrapper (Day 16)
+            info["safety_cost"] = safety_cost
+        else:
+            # Interventions (WARN, DELETE, BAN) yield 0 engagement reward.
+            # (Note: False positive penalties will be added in Day 17)
+            reward = 0.0
+            info["safety_cost"] = 0.0
+            
+        self._episode_rewards_history.append(reward)
+        
+        # 6. Server Stats Bookkeeping (from Day 8)
+        self._total_actions += 1
+        if action == 1:
+            self._total_warns += 1
+        elif action == 3:
+            self._total_bans += 1
+            
+        if self._total_actions > 0:
+            self._server_ban_rate = self._total_bans / self._total_actions
+            self._server_warn_rate = self._total_warns / self._total_actions
+            
+        #info = {}
+        
+        return obs, reward, terminated, truncated, info
 
-
-if __name__ == "__main__":
-    main()
+    # Optional: stub for MaskablePPO (to be filled on Day 10)
+    def action_masks(self) -> np.ndarray:
+        """
+        Returns a boolean mask of valid actions for the current state.
+        Shape: (4,) mapping to [ALLOW, WARN, DELETE, BAN].
+        True means the action is allowed.
+        """
+        mask = np.ones(self.action_space.n, dtype=bool)
+        
+        # Get current step data
+        idx = self._current_step_in_chunk
+        current_text = self._current_chunk.messages[idx]
+        current_score = self._current_chunk.toxicity_scores[idx]
+        current_lang = self._current_language
+        
+        # Rule 1: Admin protection (Mocked for synthetic data)
+        # We will designate 'user_0000' as our mock admin for this environment.
+        if self._current_user_id == "user_0000":
+            mask[1] = False  # No WARN
+            mask[2] = False  # No DELETE
+            mask[3] = False  # No BAN
+            
+        # Rule 2: Deleted message masking
+        # (State transitions in Day 11 will replace text with "[DELETED]")
+        if current_text == "[DELETED]":
+            mask[2] = False  # Cannot DELETE again
+            mask[3] = False  # Cannot BAN based on already deleted text
+            
+        # Rule 3: Multilingual Uncertainty Guardrail
+        # Prevent irreversible BANs if the language isn't well-supported AND the score is highly ambiguous.
+        if current_lang not in SUPPORTED_LANGUAGES and (0.4 < current_score < 0.6):
+            mask[3] = False  # No BAN
+            
+        return mask

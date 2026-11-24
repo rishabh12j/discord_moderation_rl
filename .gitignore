@@ -2,33 +2,63 @@
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-env/
-venv/
-discord_rl/
 *.egg-info/
+dist/
+build/
+*.egg
 
-# Data
-data/raw/*
-data/processed/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
-
-# Models
-models/checkpoints/*.zip
-models/*.pt
-*.pkl
-
-# Logs
-logs/
-wandb/
-
-# Jupyter
-.ipynb_checkpoints/
+# Virtual environments
+.venv/
+venv/
+env/
 
 # IDE
 .vscode/
 .idea/
 *.swp
-data/embeddings/*.npy 
+*.swo
+
+# Environment variables (contains secrets)
+.env
+
+# Data artifacts (large, regeneratable)
+data/raw/
+data/processed/*.npy
+data/processed/*.json
+data/processed/*.parquet
+!data/processed/toxicity_calibration.json
+data/bot/*.db
+data/embeddings.npy
+data/embeddings_meta.json
+data/toxicity_scores.npy
+data/toxicity_scores_meta.json
+data/user_norms.json
+data/user_norms_meta.json
+data/calibrated_thresholds.json
+
+# Model weights (large binary files)
+data/models/*.zip
+data/models/best/*.zip
+data/models/bc_init.zip
+
+# HuggingFace cache
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# LaTeX build artefacts
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+
+# Claude memory
+.claude/
+
+# Misc
+0.30

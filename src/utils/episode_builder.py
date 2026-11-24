@@ -1,302 +1,119 @@
-"""
-Episode Builder - Generates conversation chunks for RL episodes.
-Pre-loads embeddings and user features for fast access during training.
-"""
+from __future__ import annotations
 
-import pandas as pd
-import numpy as np
-import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import random
+from typing import Dict, Generator, List, Any, Optional
 
-class EpisodeBuilder:
+import numpy as np
+import pandas as pd
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+
+PROCESSED_PATH = DATA_DIR / "processed" / "messages_with_language.parquet"
+EMBEDDINGS_PATH = DATA_DIR / "embeddings.npy"
+TOX_SCORES_PATH = DATA_DIR / "toxicity_scores.npy"
+
+
+@dataclass
+class EpisodeChunk:
+    messages: List[str]
+    embeddings: np.ndarray
+    toxicity_scores: np.ndarray
+    languages: List[str]
+    user_ids: List[str]
+    thread_id: Any
+
+
+def load_base_data() -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    if not PROCESSED_PATH.exists():
+        raise FileNotFoundError(
+            f"{PROCESSED_PATH} not found. Run data_ingestion.py first."
+        )
+    if not EMBEDDINGS_PATH.exists():
+        raise FileNotFoundError(
+            f"{EMBEDDINGS_PATH} not found. Run precompute_embeddings.py first."
+        )
+    if not TOX_SCORES_PATH.exists():
+        raise FileNotFoundError(
+            f"{TOX_SCORES_PATH} not found. Run precompute_scores.py first."
+        )
+
+    df = pd.read_parquet(PROCESSED_PATH).reset_index(drop=True)
+    embeddings = np.load(EMBEDDINGS_PATH)
+    scores = np.load(TOX_SCORES_PATH)
+
+    n_df = len(df)
+    if embeddings.shape[0] != n_df or scores.shape[0] != n_df:
+        raise ValueError(
+            f"Length mismatch: df={n_df}, embeddings={embeddings.shape[0]}, "
+            f"scores={scores.shape[0]}"
+        )
+
+    required_cols = {"message_text", "language", "user_id", "thread_id", "timestamp"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in dataframe: {missing}")
+
+    # sort by thread, then timestamp for chronological chunks
+    df = df.sort_values(["thread_id", "timestamp"]).reset_index(drop=True)
+
+    return df, embeddings, scores
+
+
+def episode_generator(
+    df: pd.DataFrame,
+    embeddings: np.ndarray,
+    scores: np.ndarray,
+    chunk_size: int = 20,
+    min_chunk_size: Optional[int] = None,
+) -> Generator[EpisodeChunk, None, None]:
     """
-    Builds RL episodes from conversation data.
-    
-    An episode = one conversation thread (20 messages).
-    Pre-loads all data for O(1) lookups during training.
+    Yield fixed-length conversation chunks with aligned arrays.
     """
-    
-    def __init__(self,
-                 conversations_path="data/processed/conversations_with_users.csv",
-                 embeddings_path="data/embeddings/message_embeddings.npy",
-                 user_lookup_path="data/processed/user_lookup.json",
-                 messages_per_episode=20):
-        """
-        Initialize episode builder with pre-loaded data.
-        
-        Args:
-            conversations_path: Path to conversations CSV
-            embeddings_path: Path to pre-computed embeddings
-            user_lookup_path: Path to user feature lookup
-            messages_per_episode: Messages per episode (default 20)
-        """
-        print("=" * 70)
-        print("Initializing Episode Builder")
-        print("=" * 70)
-        
-        # Load conversations
-        print(f"\n[1/3] Loading conversations from {conversations_path}...")
-        self.conversations = pd.read_csv(conversations_path)
-        print(f"✓ Loaded {len(self.conversations)} messages")
-        
-        # Load embeddings
-        print(f"\n[2/3] Loading pre-computed embeddings from {embeddings_path}...")
-        self.embeddings = np.load(embeddings_path)
-        print(f"✓ Loaded embeddings: shape {self.embeddings.shape}")
-        
-        # Verify alignment
-        assert len(self.embeddings) == len(self.conversations), \
-            f"Embedding-conversation mismatch: {len(self.embeddings)} != {len(self.conversations)}"
-        
-        # Load user lookup
-        print(f"\n[3/3] Loading user features from {user_lookup_path}...")
-        with open(user_lookup_path) as f:
-            self.user_lookup = json.load(f)
-        print(f"✓ Loaded {len(self.user_lookup)} user profiles")
-        
-        # Build conversation index for fast sampling
-        self.messages_per_episode = messages_per_episode
-        self._build_conversation_index()
-        
-        print("\n" + "=" * 70)
-        print("✅ Episode Builder Ready!")
-        print("=" * 70)
-        print(f"\nTotal episodes available: {len(self.conversation_ids)}")
-        print(f"Messages per episode: {self.messages_per_episode}")
-        print(f"Total messages: {len(self.conversations)}")
-    
-    def _build_conversation_index(self):
-        """Build index of valid conversation IDs."""
-        print("\nBuilding conversation index...")
-        
-        # Group by conversation_id
-        conv_groups = self.conversations.groupby('conversation_id')
-        
-        # Filter conversations with exactly messages_per_episode messages
-        self.conversation_ids = [
-            conv_id for conv_id, group in conv_groups 
-            if len(group) == self.messages_per_episode
-        ]
-        
-        print(f"✓ Indexed {len(self.conversation_ids)} valid conversations")
-        
-        # Calculate statistics
-        toxic_counts = []
-        for conv_id in self.conversation_ids:
-            conv_data = self.conversations[self.conversations['conversation_id'] == conv_id]
-            toxic_counts.append(conv_data['toxic'].sum())
-        
-        toxic_counts = np.array(toxic_counts)
-        print(f"  Average toxic messages per conversation: {toxic_counts.mean():.1f}")
-        print(f"  Conversations with >10 toxic messages: {(toxic_counts > 10).sum()}")
-    
-    def get_episode(self, conversation_id: int) -> Dict:
-        """
-        Get a complete episode (conversation) by ID.
-        
-        Args:
-            conversation_id: Conversation ID to retrieve
-            
-        Returns:
-            Dict containing:
-            - messages: List of message dicts
-            - embeddings: np.ndarray of shape (N, 384)
-            - user_features: List of user feature dicts
-            - metadata: Episode metadata
-        """
-        # Get conversation messages
-        conv_mask = self.conversations['conversation_id'] == conversation_id
-        conv_df = self.conversations[conv_mask].sort_values('message_id').reset_index(drop=True)
-        
-        if len(conv_df) == 0:
-            raise ValueError(f"Conversation {conversation_id} not found")
-        
-        # Get embeddings for this conversation
-        conv_indices = conv_df.index.tolist()
-        conv_embeddings = self.embeddings[conv_indices]
-        
-        # Build message list
-        messages = []
-        user_features = []
-        
-        for idx, row in conv_df.iterrows():
-            # Message data
-            message = {
-                'message_id': int(row['message_id']),
-                'text': row['text'],
-                'user_id': row['user_id'],
-                'toxic': int(row['toxic']),
-                'toxicity_score': float(row['toxicity_score']),
-                'timestamp': int(row['timestamp']),
-            }
-            messages.append(message)
-            
-            # User features
-            user_id = row['user_id']
-            if user_id in self.user_lookup:
-                user_features.append(self.user_lookup[user_id])
-            else:
-                # Default features for unknown users
-                user_features.append({
-                    'avg_toxicity': 0.05,
-                    'total_messages': 1,
-                    'toxic_messages': 0,
-                    'profile': 'new_user',
-                    'join_days_ago': 0,
-                })
-        
-        # Metadata
-        metadata = {
-            'conversation_id': int(conversation_id),
-            'num_messages': len(messages),
-            'total_toxicity': sum(m['toxic'] for m in messages),
-            'avg_toxicity_score': float(conv_df['toxicity_score'].mean()),
-        }
-        
-        return {
-            'messages': messages,
-            'embeddings': conv_embeddings,
-            'user_features': user_features,
-            'metadata': metadata,
-        }
-    
-    def sample_episode(self) -> Dict:
-        """
-        Sample a random episode.
-        
-        Returns:
-            Episode dict (same structure as get_episode)
-        """
-        conversation_id = random.choice(self.conversation_ids)
-        return self.get_episode(conversation_id)
-    
-    def sample_batch(self, batch_size: int) -> List[Dict]:
-        """
-        Sample a batch of episodes.
-        
-        Args:
-            batch_size: Number of episodes to sample
-            
-        Returns:
-            List of episode dicts
-        """
-        conversation_ids = random.choices(self.conversation_ids, k=batch_size)
-        return [self.get_episode(conv_id) for conv_id in conversation_ids]
-    
-    def get_train_test_split(self, test_ratio=0.2, seed=42) -> Tuple[List[int], List[int]]:
-        """
-        Split conversation IDs into train/test sets.
-        
-        Args:
-            test_ratio: Fraction for test set
-            seed: Random seed
-            
-        Returns:
-            (train_ids, test_ids)
-        """
-        random.seed(seed)
-        shuffled_ids = self.conversation_ids.copy()
-        random.shuffle(shuffled_ids)
-        
-        split_idx = int(len(shuffled_ids) * (1 - test_ratio))
-        train_ids = shuffled_ids[:split_idx]
-        test_ids = shuffled_ids[split_idx:]
-        
-        print(f"\nTrain/Test Split:")
-        print(f"  Train: {len(train_ids)} conversations")
-        print(f"  Test: {len(test_ids)} conversations")
-        
-        return train_ids, test_ids
-    
-    def iterate_episodes(self, conversation_ids: Optional[List[int]] = None, shuffle=True):
-        """
-        Generator that yields episodes.
-        
-        Args:
-            conversation_ids: List of conversation IDs to iterate over (default: all)
-            shuffle: Shuffle order
-            
-        Yields:
-            Episode dicts
-        """
-        if conversation_ids is None:
-            conversation_ids = self.conversation_ids.copy()
-        
-        if shuffle:
-            random.shuffle(conversation_ids)
-        
-        for conv_id in conversation_ids:
-            yield self.get_episode(conv_id)
+    if min_chunk_size is None:
+        min_chunk_size = chunk_size
 
+    # After sorting above, df.index no longer matches original indices.
+    # Build a mapping from new index -> embedding/score index.
+    # Because all preprocessing scripts reset_index in the same order,
+    # the index after sort is just a permutation of 0..N-1.
+    index_map = df.index.to_numpy()
 
-def main():
-    """Test episode builder."""
-    print("=" * 70)
-    print("Day 6: Episode Builder Test")
-    print("=" * 70)
-    
-    # Initialize builder
-    builder = EpisodeBuilder()
-    
-    # Test single episode retrieval
-    print("\n" + "=" * 70)
-    print("Testing Single Episode Retrieval")
-    print("=" * 70)
-    
-    episode = builder.sample_episode()
-    
-    print(f"\nEpisode Metadata:")
-    print(f"  Conversation ID: {episode['metadata']['conversation_id']}")
-    print(f"  Number of messages: {episode['metadata']['num_messages']}")
-    print(f"  Total toxic: {episode['metadata']['total_toxicity']}")
-    print(f"  Avg toxicity score: {episode['metadata']['avg_toxicity_score']:.3f}")
-    
-    print(f"\nFirst 3 messages:")
-    for i, msg in enumerate(episode['messages'][:3]):
-        print(f"\n  Message {i}:")
-        print(f"    User: {msg['user_id']}")
-        print(f"    Text: {msg['text'][:60]}...")
-        print(f"    Toxic: {msg['toxic']} (score: {msg['toxicity_score']:.3f})")
-        print(f"    User profile: {episode['user_features'][i]['profile']}")
-    
-    print(f"\nEmbeddings shape: {episode['embeddings'].shape}")
-    
-    # Test batch sampling
-    print("\n" + "=" * 70)
-    print("Testing Batch Sampling")
-    print("=" * 70)
-    
-    batch = builder.sample_batch(batch_size=5)
-    print(f"\nSampled {len(batch)} episodes")
-    
-    toxicity_rates = [ep['metadata']['avg_toxicity_score'] for ep in batch]
-    print(f"Toxicity scores: {[f'{t:.3f}' for t in toxicity_rates]}")
-    
-    # Test train/test split
-    print("\n" + "=" * 70)
-    print("Testing Train/Test Split")
-    print("=" * 70)
-    
-    train_ids, test_ids = builder.get_train_test_split(test_ratio=0.2)
-    
-    # Test iteration
-    print("\n" + "=" * 70)
-    print("Testing Episode Iteration")
-    print("=" * 70)
-    
-    print("\nIterating first 3 training episodes:")
-    for i, episode in enumerate(builder.iterate_episodes(train_ids[:3])):
-        print(f"  Episode {i}: conv_id={episode['metadata']['conversation_id']}, "
-              f"toxic={episode['metadata']['total_toxicity']}")
-    
-    print("\n" + "=" * 70)
-    print("✅ Day 6 Complete!")
-    print("=" * 70)
-    print("\nEpisode Builder is ready for RL training!")
-    print("Next: Day 7 - Gymnasium Environment Skeleton")
+    for thread_id, thread in df.groupby("thread_id", sort=False):
+        thread = thread.sort_values("timestamp")
+        idx = thread.index.to_numpy()
+
+        if len(thread) < min_chunk_size:
+            continue
+
+        for start in range(0, len(thread) - chunk_size + 1, chunk_size):
+            sel_idx = idx[start : start + chunk_size]
+
+            yield EpisodeChunk(
+                messages=thread.loc[sel_idx, "message_text"].tolist(),
+                embeddings=embeddings[index_map[sel_idx]],
+                toxicity_scores=scores[index_map[sel_idx]],
+                languages=thread.loc[sel_idx, "language"].tolist(),
+                user_ids=thread.loc[sel_idx, "user_id"].tolist(),
+                thread_id=thread_id,
+            )
 
 
 if __name__ == "__main__":
-    main()
+    df, emb, scores = load_base_data()
+    print(f"Loaded df={len(df)}, emb={emb.shape}, scores={scores.shape}")
+
+    gen = episode_generator(df, emb, scores, chunk_size=20)
+    first_chunk = next(gen, None)
+
+    if first_chunk is None:
+        print("No chunks produced. Check thread_id distribution and chunk_size.")
+    else:
+        print(f"First chunk thread_id={first_chunk.thread_id}")
+        print(f"Messages: {len(first_chunk.messages)}")
+        print(f"Embeddings shape: {first_chunk.embeddings.shape}")
+        print(f"Toxicity shape: {first_chunk.toxicity_scores.shape}")
+        print(f"Languages sample: {first_chunk.languages[:5]}")
+        print(f"User_ids sample: {first_chunk.user_ids[:5]}")
