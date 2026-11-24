@@ -1,0 +1,47 @@
+# One-off job: copies the final version from the Hugging Face Space into the
+# top level of this branch. Removed again straight after it has run.
+name: Import final version from Hugging Face Space
+on:
+  push:
+    branches: [update-2026-11]
+permissions:
+  contents: write
+concurrency:
+  group: import-from-space
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download the Space
+        run: |
+          pip install -q huggingface_hub
+          python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id="Rishabh12j/multilingual-rl-moderation",
+              repo_type="space",
+              local_dir="/tmp/space",
+              ignore_patterns=["README.md", ".gitattributes", "**/__pycache__/**", "*.pyc"],
+          )
+          PY
+          rm -rf /tmp/space/.cache
+          (cd /tmp/space && find . -type f | sort) | tee /tmp/files.txt
+          echo "files: $(wc -l < /tmp/files.txt)"
+      - name: Copy into the repo and commit
+        run: |
+          if [ -n "$(git log -1 --format=%s | grep 'Import final version')" ]; then echo "already imported"; exit 0; fi
+          cp -a /tmp/space/. .
+          git config user.name "Rishabh Jain"
+          git config user.email "rishabh12j@gmail.com"
+          # The Space's .gitignore hides data and the model checkpoint; add them on purpose.
+          sed 's#^\./##' /tmp/files.txt | xargs -d '\n' git add -f --
+          git status --short
+          git commit -q -m "Import final version from the Hugging Face Space" \
+            -m "Source: https://huggingface.co/spaces/Rishabh12j/multilingual-rl-moderation" \
+            -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>" \
+            -m "Claude-Session: https://claude.ai/code/session_01AU897tAmcByZmQozibVZ8X"
+          git push origin HEAD:update-2026-11
